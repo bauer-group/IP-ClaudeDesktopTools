@@ -1,6 +1,6 @@
 # IP-ClaudeDesktopTools
 
-Interne Werkzeuge fuer Claude Desktop auf Windows. Jedes Tool liegt in einem eigenen Unterordner unter `tools/`.
+Interne Werkzeuge fuer Claude Desktop. Jedes Tool liegt in einem eigenen Unterordner unter `tools/`.
 
 ## Tools
 
