@@ -1,11 +1,15 @@
 <#
 .SYNOPSIS
     One-Click Launcher fuer den Cowork Folder Patch.
-    Laedt das Python-Skript aus dem GitHub-Repository und fuehrt es aus.
+    Nutzt das lokale Python-Skript oder laedt es von GitHub.
 
 .DESCRIPTION
-    Kann direkt aus dem Browser oder per PowerShell-Einzeiler gestartet werden:
+    Kann lokal oder per PowerShell-Einzeiler gestartet werden:
 
+    # Lokal (empfohlen):
+    .\run.ps1
+
+    # Remote:
     irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/cowork-folder-patch/run.ps1 | iex
 
 .NOTES
@@ -16,7 +20,6 @@ $ErrorActionPreference = "Stop"
 $RepoBase = "https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main"
 $ToolPath = "$RepoBase/tools/cowork-folder-patch/patch_cowork_folders.py"
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "claude-folder-patch"
-$ScriptPath = Join-Path $TmpDir "patch_cowork_folders.py"
 
 # ── Pruefe Python ──
 $Python = $null
@@ -52,21 +55,38 @@ try {
     exit 1
 }
 
-# ── Lade Skript ──
+# ── Finde Patch-Skript ──
 Write-Host ""
 Write-Host "  Claude Cowork Folder Patch - One-Click Launcher" -ForegroundColor Cyan
 Write-Host "  ================================================" -ForegroundColor Cyan
 Write-Host ""
 
-if (-not (Test-Path $TmpDir)) { New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null }
+# Strategie: Lokales Skript bevorzugen, GitHub als Fallback
+$ScriptPath = $null
 
-Write-Host "  [*] Lade Patch-Skript von GitHub..." -ForegroundColor Gray
-try {
-    Invoke-RestMethod -Uri $ToolPath -OutFile $ScriptPath
-} catch {
-    Write-Host "  [X] Download fehlgeschlagen: $($_.Exception.Message)" -ForegroundColor Red
-    pause
-    exit 1
+# 1. Neben dieser run.ps1 (lokale Ausfuehrung)
+$LocalScript = Join-Path $PSScriptRoot "patch_cowork_folders.py"
+if ($PSScriptRoot -and (Test-Path $LocalScript)) {
+    $ScriptPath = $LocalScript
+    Write-Host "  [+] Lokales Skript gefunden: $LocalScript" -ForegroundColor Green
+}
+
+# 2. GitHub-Download als Fallback (z.B. bei irm|iex)
+if (-not $ScriptPath) {
+    $DownloadPath = Join-Path $TmpDir "patch_cowork_folders.py"
+    if (-not (Test-Path $TmpDir)) { New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null }
+
+    Write-Host "  [*] Kein lokales Skript, lade von GitHub..." -ForegroundColor Gray
+    try {
+        Invoke-RestMethod -Uri $ToolPath -OutFile $DownloadPath
+        $ScriptPath = $DownloadPath
+        Write-Host "  [+] Download erfolgreich" -ForegroundColor Green
+    } catch {
+        Write-Host "  [X] Download fehlgeschlagen: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  [!] Tipp: run.ps1 im selben Ordner wie patch_cowork_folders.py ausfuehren" -ForegroundColor Yellow
+        pause
+        exit 1
+    }
 }
 
 # ── Auswahl ──
@@ -91,8 +111,8 @@ $cmd = switch ($choice) {
 
 # ── Ausfuehren (mit Elevation) ──
 Write-Host ""
-$args = @($ScriptPath) + $cmd.Split(" ")
-Start-Process -FilePath $Python -ArgumentList $args -Verb RunAs -Wait
+$pyArgs = @($ScriptPath) + $cmd.Split(" ")
+Start-Process -FilePath $Python -ArgumentList $pyArgs -Verb RunAs -Wait
 
 Write-Host ""
 Write-Host "  Fertig. Enter zum Beenden..." -ForegroundColor Gray
