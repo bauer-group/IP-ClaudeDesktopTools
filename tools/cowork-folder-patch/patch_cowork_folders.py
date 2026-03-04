@@ -5,10 +5,8 @@ Claude Desktop Cowork – Folder Restriction Patch
 Removes the home-directory validation from the Cowork folder picker,
 enabling network drives, external drives, and redirected folders.
 
-Based on the 3-phase technique from shraga100/claude-desktop-rtl-patch:
-  Phase 1: ASAR Injection  (neutralize JS validation)
+  Phase 1: ASAR Injection  (neutralize JS validation in app.asar)
   Phase 2: Hash Replacement (update integrity hash in claude.exe)
-  Phase 3: Certificate Swap (replace embedded cert in cowork-svc.exe)
 
 Requirements: Python 3.8+, Node.js (npx), PowerShell 5.1+, Administrator
 """
@@ -16,8 +14,8 @@ Requirements: Python 3.8+, Node.js (npx), PowerShell 5.1+, Administrator
 from __future__ import annotations
 
 import argparse
-import base64
 import ctypes
+from dataclasses import dataclass
 import glob
 import hashlib
 import os
@@ -28,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -37,10 +34,9 @@ from typing import List, Optional, Tuple
 # ─────────────────────────────────────────────────────────────
 
 PATCH_MARKER = "/*cowork-folder-patched*/"
-CERT_FRIENDLY_NAME = "Claude_FolderPatch_SelfSigned"
 LOG_PATH = os.path.join(tempfile.gettempdir(), "claude-cowork-folder-patch.log")
 TMP_DIR = os.path.join(tempfile.gettempdir(), "claude_folder_patch_tmp")
-VERSION = "3.0"
+VERSION = "4.0"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -113,7 +109,6 @@ class InstallPaths:
     resources_dir: str
     asar_path: str
     exe_path: str
-    svc_path: str
     layout: str  # "msix" or "classic"
 
 
@@ -160,11 +155,9 @@ class ClaudeFinder:
         if not os.path.isfile(exe):
             exe = os.path.join(app_dir, "Claude.exe")
 
-        svc = os.path.join(resources_dir, "cowork-svc.exe")
-
         return InstallPaths(
             base_dir=base, app_dir=app_dir, resources_dir=resources_dir,
-            asar_path=asar, exe_path=exe, svc_path=svc, layout="msix"
+            asar_path=asar, exe_path=exe, layout="msix"
         )
 
     def _find_classic(self) -> Optional[InstallPaths]:
@@ -179,11 +172,10 @@ class ClaudeFinder:
                 exe = os.path.join(base, "claude.exe")
                 if not os.path.isfile(exe):
                     exe = os.path.join(base, "Claude.exe")
-                svc = os.path.join(base, "resources", "cowork-svc.exe")
                 return InstallPaths(
                     base_dir=base, app_dir=base,
                     resources_dir=os.path.join(base, "resources"),
-                    asar_path=asar, exe_path=exe, svc_path=svc,
+                    asar_path=asar, exe_path=exe,
                     layout="classic"
                 )
         return None
@@ -650,247 +642,6 @@ class ExePatcher:
 
 
 # ─────────────────────────────────────────────────────────────
-# Phase 3: Certificate Patcher
-# ─────────────────────────────────────────────────────────────
-
-class CertPatcher:
-    """Locate, replace, and re-sign certificates via PowerShell."""
-
-    def __init__(self, svc_path: str, exe_path: str, logger: Logger):
-        self.svc_path = svc_path
-        self.exe_path = exe_path
-        self.log = logger
-        self._thumbprint: Optional[str] = None
-
-    def _ps(self, script: str, timeout: int = 60) -> subprocess.CompletedProcess:
-        """Run a PowerShell command and return the result."""
-        return subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True, text=True, timeout=timeout
-        )
-
-    # ── Find embedded certificates ────────────────────────────
-
-    def find_embedded_certs(self, data: bytes) -> List[Tuple[int, int]]:
-        """
-        Find all copies of the Anthropic DER certificate in cowork-svc.exe.
-        Searches for 'Anthropic, PBC' anchor, scans backwards for DER header.
-        Deduplicates overlapping/nested entries, keeping only the innermost cert.
-        Returns list of (offset, size) tuples.
-        """
-        anchor = b"Anthropic, PBC"
-        raw_certs: list[tuple[int, int]] = []
-
-        search_offset = 0
-        while True:
-            anchor_pos = data.find(anchor, search_offset)
-            if anchor_pos == -1:
-                break
-
-            # Find ALL DER headers near this anchor (there may be nested structures)
-            limit = max(0, anchor_pos - 2000)
-            candidates: list[tuple[int, int]] = []
-            for i in range(anchor_pos, limit, -1):
-                if i + 3 >= len(data):
-                    continue
-                if data[i] == 0x30 and data[i + 1] == 0x82:
-                    total_size = 4 + (data[i + 2] << 8 | data[i + 3])
-                    if (500 < total_size < 4000
-                            and i < anchor_pos
-                            and (i + total_size) > anchor_pos):
-                        candidates.append((i, total_size))
-
-            # Keep only the smallest (innermost) cert for this anchor
-            if candidates:
-                smallest = min(candidates, key=lambda c: c[1])
-                raw_certs.append(smallest)
-
-            search_offset = anchor_pos + 1
-
-        # Deduplicate by offset
-        seen: dict[int, int] = {}
-        for offset, size in raw_certs:
-            if offset not in seen:
-                seen[offset] = size
-
-        return sorted(seen.items())
-
-    # ── Get original certificate subject ──────────────────────
-
-    def get_original_subject(self) -> str:
-        bak = self.exe_path + ".bak"
-        source = bak if os.path.isfile(bak) else self.exe_path
-        r = self._ps(
-            f'(Get-AuthenticodeSignature -FilePath "{source}").SignerCertificate.Subject'
-        )
-        subject = r.stdout.strip()
-        if subject:
-            self.log.info(f"Original-Subject: {subject}")
-            return subject
-        self.log.warn("Original-Subject nicht lesbar, verwende Fallback.")
-        return "CN=Claude-FolderPatch"
-
-    # ── Generate self-signed certificate ──────────────────────
-
-    def generate_cert(self, subject: str, max_size: int, max_attempts: int = 10):
-        """Generate a code-signing cert that fits within the old cert slot."""
-        # Cleanup old patch certs
-        self._ps(f'''
-            Get-ChildItem Cert:\\LocalMachine\\My |
-                Where-Object {{ $_.FriendlyName -eq "{CERT_FRIENDLY_NAME}" }} |
-                Remove-Item -ErrorAction SilentlyContinue
-            Get-ChildItem Cert:\\LocalMachine\\Root |
-                Where-Object {{ $_.FriendlyName -eq "{CERT_FRIENDLY_NAME}" }} |
-                Remove-Item -ErrorAction SilentlyContinue
-        ''')
-
-        # Escape single quotes in subject for PowerShell
-        ps_subject = subject.replace("'", "''")
-
-        for attempt in range(1, max_attempts + 1):
-            self.log.info(f"Generiere Zertifikat (Versuch {attempt}/{max_attempts})...")
-
-            r = self._ps(f'''
-                $cert = New-SelfSignedCertificate `
-                    -Subject '{ps_subject}' `
-                    -Type CodeSigningCert `
-                    -CertStoreLocation "Cert:\\LocalMachine\\My" `
-                    -FriendlyName "{CERT_FRIENDLY_NAME}" `
-                    -KeyAlgorithm RSA -KeyLength 2048
-                "$($cert.RawData.Length)|$($cert.Thumbprint)"
-            ''')
-
-            # Parse the last line containing "|" (skip any PS warnings/progress)
-            output_lines = r.stdout.strip().splitlines()
-            data_line = next(
-                (line for line in reversed(output_lines) if "|" in line), ""
-            )
-            if not data_line:
-                self.log.warn(f"Zertifikat-Erstellung fehlgeschlagen: {r.stderr.strip()}")
-                continue
-
-            try:
-                parts = data_line.split("|", 1)
-                cert_size = int(parts[0].strip())
-                thumbprint = parts[1].strip()
-            except (ValueError, IndexError):
-                self.log.warn(f"Unerwartete Ausgabe: {data_line}")
-                continue
-
-            if cert_size <= max_size:
-                # Add to trusted root store
-                self._ps(f'''
-                    $cert = Get-ChildItem "Cert:\\LocalMachine\\My\\{thumbprint}"
-                    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root","LocalMachine")
-                    $store.Open("ReadWrite")
-                    $store.Add($cert)
-                    $store.Close()
-                ''')
-                self._thumbprint = thumbprint
-                self.log.success(f"Zertifikat passt ({cert_size} <= {max_size} Bytes)")
-                return
-            else:
-                self.log.warn(f"Zertifikat zu gross ({cert_size} > {max_size}). Neuer Versuch...")
-                self._ps(f'Remove-Item "Cert:\\LocalMachine\\My\\{thumbprint}" -ErrorAction SilentlyContinue')
-
-        raise RuntimeError(
-            f"Konnte nach {max_attempts} Versuchen kein passendes Zertifikat generieren."
-        )
-
-    # ── Get cert raw bytes ────────────────────────────────────
-
-    def get_cert_raw_bytes(self) -> bytes:
-        r = self._ps(f'''
-            $cert = Get-ChildItem "Cert:\\LocalMachine\\My\\{self._thumbprint}"
-            [Convert]::ToBase64String($cert.RawData)
-        ''')
-        b64 = r.stdout.strip()
-        if not b64:
-            raise RuntimeError("Konnte Zertifikat-Bytes nicht lesen.")
-        return base64.b64decode(b64)
-
-    # ── Sign executable ───────────────────────────────────────
-
-    def sign_exe(self, exe_path: str):
-        self.log.info(f"Signiere {os.path.basename(exe_path)}...")
-        r = self._ps(f'''
-            $cert = Get-ChildItem "Cert:\\LocalMachine\\My\\{self._thumbprint}"
-            $result = Set-AuthenticodeSignature -FilePath "{exe_path}" `
-                -Certificate $cert -HashAlgorithm SHA256
-            $result.Status
-        ''')
-        status = r.stdout.strip()
-        if status != "Valid":
-            raise RuntimeError(
-                f"Signierung {os.path.basename(exe_path)} fehlgeschlagen: {status}. "
-                f"Stderr: {r.stderr.strip()}"
-            )
-        self.log.success(f"{os.path.basename(exe_path)} signiert")
-
-    # ── Orchestration ─────────────────────────────────────────
-
-    def run(self):
-        """Execute Phase 3: locate cert, generate replacement, swap, sign."""
-        if not os.path.isfile(self.svc_path):
-            self.log.warn("cowork-svc.exe nicht gefunden. Phase 3 uebersprungen.")
-            return
-        if not os.path.isfile(self.exe_path):
-            self.log.warn("claude.exe nicht gefunden. Phase 3 uebersprungen.")
-            return
-
-        # Read from backup for idempotency
-        svc_bak = self.svc_path + ".bak"
-        svc_source = svc_bak if os.path.isfile(svc_bak) else self.svc_path
-        svc_data = bytearray(Path(svc_source).read_bytes())
-
-        # 1. Find all embedded certificate copies
-        cert_positions = self.find_embedded_certs(bytes(svc_data))
-        if not cert_positions:
-            raise RuntimeError(
-                "Anthropic-Zertifikat nicht in cowork-svc.exe gefunden!"
-            )
-        for offset, size in cert_positions:
-            self.log.info(f"Zertifikat bei 0x{offset:x} ({size} Bytes)")
-
-        # Use the smallest slot size as constraint
-        min_slot = min(size for _, size in cert_positions)
-
-        # 2. Get original subject and generate fitting cert
-        subject = self.get_original_subject()
-        self.generate_cert(subject, min_slot)
-
-        # 3. Sign claude.exe first (before touching cowork-svc)
-        ExePatcher._wait_unlock(self.exe_path)
-        self.sign_exe(self.exe_path)
-
-        # 4. Replace all cert copies in cowork-svc.exe
-        new_cert = self.get_cert_raw_bytes()
-        if len(new_cert) > min_slot:
-            raise RuntimeError(
-                f"Neues Zertifikat ({len(new_cert)}B) groesser als Slot ({min_slot}B). "
-                f"Dies sollte nicht passieren — bitte erneut versuchen."
-            )
-        self.log.info(
-            f"Ersetze {len(cert_positions)} Zertifikat-Kopie(n) in cowork-svc.exe "
-            f"(Cert: {len(new_cert)} Bytes)..."
-        )
-
-        for offset, old_size in cert_positions:
-            padded = new_cert + b"\x00" * (old_size - len(new_cert))
-            svc_data[offset:offset + old_size] = padded
-            self.log.detail(f"Ersetzt bei 0x{offset:x} (Padding: {old_size - len(new_cert)} Bytes)")
-
-        ExePatcher._wait_unlock(self.svc_path)
-        Path(self.svc_path).write_bytes(bytes(svc_data))
-        self.log.success("Zertifikat(e) in cowork-svc.exe ersetzt")
-
-        # 5. Sign cowork-svc.exe
-        self.sign_exe(self.svc_path)
-
-        self.log.success("Phase 3 abgeschlossen")
-
-
-# ─────────────────────────────────────────────────────────────
 # Patch Manager (Orchestration)
 # ─────────────────────────────────────────────────────────────
 
@@ -1025,20 +776,6 @@ class PatchManager:
             else:
                 self.log.info(f"{os.path.basename(bak)} existiert bereits")
 
-    def _cleanup_certs(self):
-        """Remove all patch certificates from the Windows certificate store."""
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f'''
-                Get-ChildItem Cert:\\LocalMachine\\My |
-                    Where-Object {{ $_.FriendlyName -eq "{CERT_FRIENDLY_NAME}" }} |
-                    Remove-Item -ErrorAction SilentlyContinue
-                Get-ChildItem Cert:\\LocalMachine\\Root |
-                    Where-Object {{ $_.FriendlyName -eq "{CERT_FRIENDLY_NAME}" }} |
-                    Remove-Item -ErrorAction SilentlyContinue
-            '''],
-            capture_output=True, timeout=30
-        )
-
     # ── Install ───────────────────────────────────────────────
 
     def install(self, dry_run: bool = False):
@@ -1054,7 +791,6 @@ class PatchManager:
         self.log.success(f"Claude gefunden: {p.base_dir} ({p.layout})")
         self.log.info(f"ASAR: {p.asar_path}")
         self.log.info(f"EXE:  {p.exe_path}")
-        self.log.info(f"SVC:  {p.svc_path}")
 
         if not dry_run:
             self._stop_services()
@@ -1064,7 +800,7 @@ class PatchManager:
                 self._take_ownership(p.app_dir)
                 self._take_ownership(p.resources_dir)
 
-            self._create_backups([p.asar_path, p.exe_path, p.svc_path])
+            self._create_backups([p.asar_path, p.exe_path])
 
         try:
             # Phase 1: ASAR Injection
@@ -1082,11 +818,6 @@ class PatchManager:
             self.log.step("Phase 2: Hash-Ersetzung in claude.exe")
             exe = ExePatcher(p.exe_path, self.log)
             exe.replace_hash(old_hash, new_hash)
-
-            # Phase 3: Certificate Swap
-            self.log.step("Phase 3: Zertifikat-Tausch")
-            cert = CertPatcher(p.svc_path, p.exe_path, self.log)
-            cert.run()
 
             # Cleanup and start
             self.log.step("Aufraeumen und Starten")
@@ -1140,7 +871,7 @@ class PatchManager:
 
         self.log.info("Stelle Originaldateien wieder her...")
         restored = False
-        for orig in [paths.asar_path, paths.exe_path, paths.svc_path]:
+        for orig in [paths.asar_path, paths.exe_path]:
             bak = orig + ".bak"
             if os.path.isfile(bak):
                 try:
@@ -1151,10 +882,6 @@ class PatchManager:
                     self.log.warn(f"Fehler bei {os.path.basename(orig)}: {e}")
             else:
                 self.log.warn(f"Kein Backup fuer {os.path.basename(orig)}")
-
-        self.log.info("Entferne Patch-Zertifikate...")
-        self._cleanup_certs()
-        self.log.success("Patch-Zertifikate entfernt")
 
         # Cleanup temp dir
         if os.path.exists(TMP_DIR):
