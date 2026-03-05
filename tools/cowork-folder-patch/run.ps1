@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    One-Click Launcher fuer den Cowork Folder Patch.
+    One-Click Launcher fuer den Cowork Folder Bypass.
     Nutzt das lokale Python-Skript oder laedt es von GitHub.
 
 .DESCRIPTION
@@ -13,7 +13,7 @@
     irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/cowork-folder-patch/run.ps1 | iex
 
 .NOTES
-    Erfordert: Python 3.8+, Node.js (npx), Administrator-Rechte
+    Erfordert: Python 3.8+ (keine Admin-Rechte noetig)
 #>
 
 $ErrorActionPreference = "Stop"
@@ -42,23 +42,13 @@ if (-not $Python) {
     exit 1
 }
 
-# ── Pruefe Node.js ──
-try {
-    $npxVer = npx --version 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "npx fehlt" }
-} catch {
-    Write-Host ""
-    Write-Host "  [X] Node.js (npx) nicht gefunden!" -ForegroundColor Red
-    Write-Host "      Bitte installieren: https://nodejs.org" -ForegroundColor Yellow
-    Write-Host ""
-    pause
-    exit 1
-}
-
-# ── Finde Patch-Skript ──
+# ── Finde Bypass-Skript ──
 Write-Host ""
-Write-Host "  Claude Cowork Folder Patch - One-Click Launcher" -ForegroundColor Cyan
-Write-Host "  ================================================" -ForegroundColor Cyan
+Write-Host "  Claude Cowork Folder Bypass v5.0" -ForegroundColor Cyan
+Write-Host "  =================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Umgeht die Home-Verzeichnis-Beschraenkung im Cowork" -ForegroundColor Gray
+Write-Host "  Folder Picker durch Config-Manipulation (kein Patching)." -ForegroundColor Gray
 Write-Host ""
 
 # Strategie: Lokales Skript bevorzugen, GitHub als Fallback
@@ -68,7 +58,7 @@ $ScriptPath = $null
 $LocalScript = Join-Path $PSScriptRoot "patch_cowork_folders.py"
 if ($PSScriptRoot -and (Test-Path $LocalScript)) {
     $ScriptPath = $LocalScript
-    Write-Host "  [+] Lokales Skript gefunden: $LocalScript" -ForegroundColor Green
+    Write-Host "  [+] Lokales Skript gefunden" -ForegroundColor Green
 }
 
 # 2. GitHub-Download als Fallback (z.B. bei irm|iex)
@@ -92,27 +82,53 @@ if (-not $ScriptPath) {
 # ── Auswahl ──
 Write-Host ""
 Write-Host "  Aktion waehlen:" -ForegroundColor White
-Write-Host "    1. Patch installieren" -ForegroundColor White
-Write-Host "    2. Patch entfernen (Originalzustand)" -ForegroundColor White
-Write-Host "    3. Status pruefen" -ForegroundColor White
-Write-Host "    4. Nur analysieren (Dry-Run)" -ForegroundColor White
+Write-Host "    1. Ordner hinzufuegen (Pfad eingeben)" -ForegroundColor White
+Write-Host "    2. Ordner entfernen" -ForegroundColor White
+Write-Host "    3. Aktuelle Ordner anzeigen" -ForegroundColor White
+Write-Host "    4. System-Status" -ForegroundColor White
 Write-Host "    5. Beenden" -ForegroundColor White
 Write-Host ""
 $choice = Read-Host "  Auswahl (1-5)"
 
-$cmd = switch ($choice) {
-    "1" { "install" }
-    "2" { "restore" }
-    "3" { "status" }
-    "4" { "install --dry-run" }
+switch ($choice) {
+    "1" {
+        Write-Host ""
+        $folder = Read-Host "  Ordnerpfad eingeben (z.B. C:\Projects oder \\server\share)"
+        if (-not $folder) {
+            Write-Host "  Kein Pfad eingegeben." -ForegroundColor Red
+            pause
+            exit 1
+        }
+        $pyArgs = @($ScriptPath, "add", $folder)
+        & $Python @pyArgs
+    }
+    "2" {
+        Write-Host ""
+        # Show current folders first
+        & $Python $ScriptPath "list"
+        Write-Host ""
+        $folder = Read-Host "  Ordnerpfad zum Entfernen eingeben"
+        if (-not $folder) {
+            Write-Host "  Kein Pfad eingegeben." -ForegroundColor Red
+            pause
+            exit 1
+        }
+        $pyArgs = @($ScriptPath, "remove", $folder)
+        & $Python @pyArgs
+    }
+    "3" {
+        & $Python $ScriptPath "list"
+    }
+    "4" {
+        & $Python $ScriptPath "status"
+    }
     "5" { exit 0 }
-    default { Write-Host "  Ungueltige Auswahl." -ForegroundColor Red; pause; exit 1 }
+    default {
+        Write-Host "  Ungueltige Auswahl." -ForegroundColor Red
+        pause
+        exit 1
+    }
 }
-
-# ── Ausfuehren (mit Elevation) ──
-Write-Host ""
-$pyArgs = @($ScriptPath) + $cmd.Split(" ")
-Start-Process -FilePath $Python -ArgumentList $pyArgs -Verb RunAs -Wait
 
 Write-Host ""
 Write-Host "  Fertig. Enter zum Beenden..." -ForegroundColor Gray

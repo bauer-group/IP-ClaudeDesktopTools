@@ -1,1004 +1,502 @@
 #!/usr/bin/env python3
 """
-Claude Desktop Cowork – Folder Restriction Patch
+Claude Desktop Cowork – Folder Restriction Bypass
 
-Removes the home-directory validation from the Cowork folder picker,
-enabling network drives, external drives, and redirected folders.
+Bypasses the home-directory restriction in the Cowork folder picker
+by directly injecting folder paths into Claude's spaces.json and
+trusted-folders config. No binary patching, no admin rights needed.
 
-  Phase 1: ASAR Injection  (neutralize JS validation in app.asar)
-  Phase 2: Hash Replacement (update integrity hash in claude.exe)
+How it works:
+  The folder picker (browseFolder) is the ONLY validation point that
+  checks if a folder is inside %USERPROFILE%. All downstream systems
+  (SpacesManager, SessionManager, file access control) work with
+  whatever paths they receive. By writing directly to spaces.json
+  and localAgentModeTrustedFolders, we bypass browseFolder entirely.
 
-Requirements: Python 3.8+, Node.js (npx), PowerShell 5.1+, Administrator
+Usage:
+  python patch_cowork_folders.py add "C:\\Projects" "D:\\Data"
+  python patch_cowork_folders.py remove "C:\\Projects"
+  python patch_cowork_folders.py list
+  python patch_cowork_folders.py status
+
+Requirements: Python 3.8+, Claude Desktop must be restarted after changes
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
-from dataclasses import dataclass
-import glob
-import hashlib
+import json
 import os
-import re
-import shutil
-import struct
-import subprocess
 import sys
-import tempfile
+import uuid
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-# ─────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────
-
-PATCH_MARKER = "/*cowork-folder-patched*/"
-LOG_PATH = os.path.join(tempfile.gettempdir(), "claude-cowork-folder-patch.log")
-TMP_DIR = os.path.join(tempfile.gettempdir(), "claude_folder_patch_tmp")
-VERSION = "4.0"
-
+VERSION = "5.0"
 
 # ─────────────────────────────────────────────────────────────
 # Logger
 # ─────────────────────────────────────────────────────────────
 
 class Logger:
-    """Colored console output with file logging."""
+    _RESET  = "\033[0m"
+    _RED    = "\033[91m"
+    _GREEN  = "\033[92m"
+    _YELLOW = "\033[93m"
+    _CYAN   = "\033[96m"
+    _GRAY   = "\033[90m"
+    _BOLD   = "\033[1m"
 
-    # ANSI codes (Windows 10+ Terminal supports them)
-    _RESET = "\033[0m"
-    _CYAN = "\033[36m"
-    _GREEN = "\033[32m"
-    _YELLOW = "\033[33m"
-    _RED = "\033[31m"
-    _MAGENTA = "\033[35m"
-    _GRAY = "\033[90m"
-    _WHITE = "\033[97m"
-
-    def __init__(self, log_path: str):
-        self._log_path = log_path
-        self._log_file = open(log_path, "a", encoding="utf-8")
-        # Enable ANSI on Windows
+    @staticmethod
+    def _enable_ansi():
         if sys.platform == "win32":
+            import ctypes
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
-    def _ts(self) -> str:
-        return time.strftime("%H:%M:%S")
-
-    def _write_log(self, tag: str, msg: str):
-        self._log_file.write(f"[{self._ts()}] [{tag}] {msg}\n")
-        self._log_file.flush()
+    def __init__(self):
+        self._enable_ansi()
 
     def info(self, msg: str):
-        self._write_log("INFO", msg)
-        print(f"  {self._CYAN}[*]{self._RESET} {msg}")
-
-    def success(self, msg: str):
-        self._write_log("OK", msg)
         print(f"  {self._GREEN}[+]{self._RESET} {msg}")
 
     def warn(self, msg: str):
-        self._write_log("WARN", msg)
         print(f"  {self._YELLOW}[!]{self._RESET} {msg}")
 
     def error(self, msg: str):
-        self._write_log("ERROR", msg)
         print(f"  {self._RED}[X]{self._RESET} {msg}")
 
     def step(self, msg: str):
-        self._write_log("STEP", msg)
-        print(f"\n{self._MAGENTA}\u25ba {msg}{self._RESET}")
+        print(f"  {self._CYAN}[*]{self._RESET} {msg}")
 
     def detail(self, msg: str):
-        print(f"  {self._GRAY}    {msg}{self._RESET}")
+        print(f"      {self._GRAY}{msg}{self._RESET}")
 
-    def close(self):
-        self._log_file.close()
+    def header(self, msg: str):
+        print()
+        print(f"  {self._BOLD}{self._CYAN}{msg}{self._RESET}")
+        print(f"  {self._CYAN}{'=' * len(msg)}{self._RESET}")
+        print()
+
+log = Logger()
 
 
 # ─────────────────────────────────────────────────────────────
-# Installation paths
+# Paths
 # ─────────────────────────────────────────────────────────────
 
-@dataclass
-class InstallPaths:
-    base_dir: str
-    app_dir: str
-    resources_dir: str
-    asar_path: str
-    exe_path: str
-    layout: str  # "msix" or "classic"
+def get_claude_appdata() -> Path:
+    """Get Claude Desktop's %APPDATA% directory."""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError("APPDATA environment variable not set")
+    claude_dir = Path(appdata) / "Claude"
+    if not claude_dir.is_dir():
+        raise RuntimeError(f"Claude Desktop data directory not found: {claude_dir}")
+    return claude_dir
 
 
-class ClaudeFinder:
-    """Locate Claude Desktop installation on Windows."""
+def get_config_path(claude_dir: Path) -> Path:
+    return claude_dir / "claude_desktop_config.json"
 
-    def find(self) -> InstallPaths:
-        # Try MSIX first
-        paths = self._find_msix()
-        if paths:
-            return paths
 
-        # Classic install
-        paths = self._find_classic()
-        if paths:
-            return paths
+def find_session_dir(claude_dir: Path) -> Optional[Path]:
+    """Find the local-agent-mode-sessions/{accountId}/{userId}/ directory."""
+    sessions_base = claude_dir / "local-agent-mode-sessions"
+    if not sessions_base.is_dir():
+        return None
 
-        raise FileNotFoundError(
-            "Claude Desktop nicht gefunden. Unterstuetzt: MSIX (Store) und klassische Installation."
-        )
+    for account_dir in sessions_base.iterdir():
+        if not account_dir.is_dir() or account_dir.name == "skills-plugin":
+            continue
+        for user_dir in account_dir.iterdir():
+            if user_dir.is_dir():
+                return user_dir
+    return None
 
-    def _find_msix(self) -> Optional[InstallPaths]:
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "(Get-AppxPackage *Claude* | Where-Object { $_.InstallLocation -like '*WindowsApps*' } "
-                 "| Select-Object -First 1).InstallLocation"],
-                capture_output=True, text=True, timeout=15
-            )
-            base = result.stdout.strip()
-            if not base or not os.path.isdir(base):
-                return None
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return None
 
-        app_dir = os.path.join(base, "app")
-        resources_dir = os.path.join(app_dir, "resources")
-        asar = os.path.join(resources_dir, "app.asar")
+def get_spaces_path(session_dir: Path) -> Path:
+    return session_dir / "spaces.json"
 
-        if not os.path.isfile(asar):
-            return None
 
-        exe = os.path.join(app_dir, "claude.exe")
-        if not os.path.isfile(exe):
-            exe = os.path.join(app_dir, "Claude.exe")
+# ─────────────────────────────────────────────────────────────
+# Config Operations
+# ─────────────────────────────────────────────────────────────
 
-        return InstallPaths(
-            base_dir=base, app_dir=app_dir, resources_dir=resources_dir,
-            asar_path=asar, exe_path=exe, layout="msix"
-        )
+def read_config(config_path: Path) -> dict:
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
-    def _find_classic(self) -> Optional[InstallPaths]:
-        local = os.environ.get("LOCALAPPDATA", "")
-        candidates = [
-            os.path.join(local, "Programs", "claude-desktop"),
-            os.path.join(local, "Programs", "Claude"),
+
+def write_config(config_path: Path, config: dict):
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def normalize_path(folder: str) -> str:
+    """Normalize a folder path (resolve, remove trailing separators)."""
+    p = Path(folder).resolve()
+    return str(p)
+
+
+def get_trusted_folders(config: dict) -> List[str]:
+    prefs = config.get("preferences", {})
+    return prefs.get("localAgentModeTrustedFolders", [])
+
+
+def set_trusted_folders(config: dict, folders: List[str]) -> dict:
+    if "preferences" not in config:
+        config["preferences"] = {}
+    config["preferences"]["localAgentModeTrustedFolders"] = folders
+    return config
+
+
+def add_trusted_folder(config: dict, folder: str) -> dict:
+    """Add a folder to the trusted folders list if not already present."""
+    norm = normalize_path(folder)
+    trusted = get_trusted_folders(config)
+    # Check if already present (case-insensitive on Windows)
+    existing = {f.lower().rstrip("\\/") for f in trusted}
+    if norm.lower().rstrip("\\/") not in existing:
+        trusted.append(norm)
+    return set_trusted_folders(config, trusted)
+
+
+def remove_trusted_folder(config: dict, folder: str) -> dict:
+    """Remove a folder from the trusted folders list."""
+    norm = normalize_path(folder).lower().rstrip("\\/")
+    trusted = get_trusted_folders(config)
+    filtered = [f for f in trusted if f.lower().rstrip("\\/") != norm]
+    return set_trusted_folders(config, filtered)
+
+
+# ─────────────────────────────────────────────────────────────
+# Spaces Operations
+# ─────────────────────────────────────────────────────────────
+
+BYPASS_SPACE_NAME = "External Folders"
+
+def read_spaces(spaces_path: Path) -> dict:
+    if spaces_path.exists():
+        with open(spaces_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"spaces": []}
+
+
+def write_spaces(spaces_path: Path, data: dict):
+    spaces_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(spaces_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def find_bypass_space(spaces_data: dict) -> Optional[dict]:
+    """Find the bypass space in the spaces data."""
+    for space in spaces_data.get("spaces", []):
+        if space.get("name") == BYPASS_SPACE_NAME:
+            return space
+    return None
+
+
+def create_bypass_space(folders: List[str]) -> dict:
+    """Create a new space with the given folders."""
+    now = int(time.time() * 1000)
+    return {
+        "id": str(uuid.uuid4()),
+        "name": BYPASS_SPACE_NAME,
+        "folders": [{"path": normalize_path(f)} for f in folders],
+        "projects": [],
+        "instructions": "Auto-generated space for folders outside the home directory.",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+def add_folders_to_space(spaces_data: dict, folders: List[str]) -> dict:
+    """Add folders to the bypass space, creating it if needed."""
+    space = find_bypass_space(spaces_data)
+    normalized = [normalize_path(f) for f in folders]
+
+    if space is None:
+        space = create_bypass_space(folders)
+        spaces_data["spaces"].append(space)
+        return spaces_data
+
+    existing = {f["path"].lower().rstrip("\\/") for f in space.get("folders", [])}
+    for norm in normalized:
+        if norm.lower().rstrip("\\/") not in existing:
+            space["folders"].append({"path": norm})
+            existing.add(norm.lower().rstrip("\\/"))
+    space["updatedAt"] = int(time.time() * 1000)
+    return spaces_data
+
+
+def remove_folders_from_space(spaces_data: dict, folders: List[str]) -> dict:
+    """Remove folders from the bypass space."""
+    space = find_bypass_space(spaces_data)
+    if space is None:
+        return spaces_data
+
+    to_remove = {normalize_path(f).lower().rstrip("\\/") for f in folders}
+    space["folders"] = [
+        f for f in space.get("folders", [])
+        if f["path"].lower().rstrip("\\/") not in to_remove
+    ]
+    space["updatedAt"] = int(time.time() * 1000)
+
+    # Remove empty space
+    if not space["folders"]:
+        spaces_data["spaces"] = [
+            s for s in spaces_data["spaces"]
+            if s.get("name") != BYPASS_SPACE_NAME
         ]
-        for base in candidates:
-            asar = os.path.join(base, "resources", "app.asar")
-            if os.path.isfile(asar):
-                exe = os.path.join(base, "claude.exe")
-                if not os.path.isfile(exe):
-                    exe = os.path.join(base, "Claude.exe")
-                return InstallPaths(
-                    base_dir=base, app_dir=base,
-                    resources_dir=os.path.join(base, "resources"),
-                    asar_path=asar, exe_path=exe,
-                    layout="classic"
-                )
-        return None
+    return spaces_data
 
 
 # ─────────────────────────────────────────────────────────────
-# Phase 1: ASAR Patcher
+# Commands
 # ─────────────────────────────────────────────────────────────
 
-class AsarPatcher:
-    """Extract ASAR, patch JS validation functions, repack."""
-
-    def __init__(self, asar_path: str, tmp_dir: str, logger: Logger):
-        self.asar_path = asar_path
-        self.tmp_dir = tmp_dir
-        self.log = logger
-
-    # ── Hash computation ──────────────────────────────────────
-
-    @staticmethod
-    def compute_hash(asar_path: str) -> str:
-        """
-        Compute SHA-256 hex digest of the ASAR JSON header.
-        Format: skip 12 bytes, read uint32 LE (JSON size),
-        read that many bytes, decode UTF-8, hash the string.
-        """
-        with open(asar_path, "rb") as f:
-            f.seek(12)
-            raw = f.read(4)
-            if len(raw) < 4:
-                raise ValueError("ASAR file too small")
-            json_size = struct.unpack("<I", raw)[0]
-            if json_size <= 0 or json_size > 10 * 1024 * 1024:
-                raise ValueError(f"Abnormal ASAR header size: {json_size}")
-            json_bytes = f.read(json_size)
-
-        json_str = json_bytes.decode("utf-8")
-        return hashlib.sha256(json_str.encode("utf-8")).hexdigest()
-
-    # ── Extract / Pack via npx ────────────────────────────────
-
-    def extract(self, dst: str):
-        self.log.info("Extrahiere ASAR-Archiv...")
-        r = subprocess.run(
-            ["npx", "--yes", "@electron/asar", "extract", self.asar_path, dst],
-            capture_output=True, text=True, timeout=120, shell=True
-        )
-        if not os.path.isdir(dst) or not os.listdir(dst):
-            raise RuntimeError(f"ASAR-Extraktion fehlgeschlagen: {r.stderr.strip()}")
-
-    def pack(self, src: str, dst: str):
-        self.log.info("Packe ASAR-Archiv neu...")
-        r = subprocess.run(
-            ["npx", "--yes", "@electron/asar", "pack", src, dst],
-            capture_output=True, text=True, timeout=120, shell=True
-        )
-        if not os.path.isfile(dst):
-            raise RuntimeError(f"ASAR-Packing fehlgeschlagen: {r.stderr.strip()}")
-
-    # ── JS patching (structural detection) ────────────────────
-
-    def patch_js_files(self, extract_dir: str) -> List[str]:
-        """Find and patch all home-directory validation functions."""
-        results: List[str] = []
-        build_dir = os.path.join(extract_dir, ".vite", "build")
-        search_dir = build_dir if os.path.isdir(build_dir) else extract_dir
-
-        js_files = glob.glob(os.path.join(search_dir, "**", "*.js"), recursive=True)
-        self.log.info(f"Durchsuche {len(js_files)} JS-Dateien...")
-
-        for js_path in js_files:
-            try:
-                with open(js_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except (OSError, UnicodeDecodeError):
-                continue
-
-            if not content or PATCH_MARKER in content:
-                continue
-
-            original = content
-            basename = os.path.basename(js_path)
-
-            # Strategy A: Sync validators (path.relative + isAbsolute + startsWith)
-            content, a = self._patch_sync_validators(content, basename)
-            results.extend(a)
-
-            # Strategy B: Async wrappers (fs.realpath calls)
-            content, b = self._patch_async_wrappers(content, basename)
-            results.extend(b)
-
-            # Strategy C: Inline upload/permission checks
-            content, c = self._patch_inline_checks(content, basename)
-            results.extend(c)
-
-            # Strategy D: Fallback if nothing matched via structural detection
-            if not a and not b and not c:
-                content, count = self._fallback_patch(content, basename)
-                if count > 0:
-                    results.append(f"Fallback: {count} Expression(en) in {basename}")
-
-            if content != original:
-                with open(js_path, "w", encoding="utf-8") as f:
-                    f.write(PATCH_MARKER + content)
-
-        return results
-
-    def _patch_sync_validators(self, content: str, basename: str) -> Tuple[str, List[str]]:
-        """
-        Find functions matching:
-          function XX(t,e){const r=YY.relative(e,t);return!YY.isAbsolute(r)&&!r.startsWith("..")}
-
-        Key: search for the structural pattern .relative( + .isAbsolute( + .startsWith("..")
-        regardless of which variable name the path module is assigned to.
-        """
-        results: List[str] = []
-        anchor_re = re.compile(
-            r'\.relative\(\w+,\s*\w+\)\s*;'      # .relative(e,t);
-            r'\s*return\s*!'                       # return!
-            r'\w+\.isAbsolute\(\w+\)'              # XX.isAbsolute(r)
-            r'\s*&&\s*!\w+\.startsWith\("\.\."'    # &&!r.startsWith(".."
-        )
-
-        # Collect matches first, then patch in reverse order to preserve positions
-        matches = list(anchor_re.finditer(content))
-        for match in reversed(matches):
-            anchor_pos = match.start()
-
-            # Skip TAR/archive library functions
-            context_start = max(0, anchor_pos - 500)
-            context_end = min(len(content), anchor_pos + 500)
-            context = content[context_start:context_end]
-            if "TAR_ENTRY" in context or "tar_entry" in context.lower():
-                continue
-
-            func_start = self._find_function_start(content, anchor_pos)
-            if func_start is None:
-                continue
-
-            func_end = self._find_matching_brace(content, func_start)
-            if func_end is None:
-                continue
-
-            func_text = content[func_start:func_end]
-            name_match = re.match(r"(?:async\s+)?function\s+(\w+)", func_text)
-            if not name_match:
-                continue
-            func_name = name_match.group(1)
-
-            is_async = func_text.startswith("async")
-            if is_async:
-                replacement = f"async function {func_name}(t,e){{return true}}"
-            else:
-                replacement = f"function {func_name}(t,e){{return true}}"
-
-            content = content[:func_start] + replacement + content[func_end:]
-
-            results.append(f"Sync-Validator '{func_name}' gepatcht in {basename}")
-            self.log.success(f"Sync-Validator '{func_name}' gepatcht in {basename}")
-
-        return content, results
-
-    def _patch_async_wrappers(self, content: str, basename: str) -> Tuple[str, List[str]]:
-        """
-        Find async wrappers that call a sync validator via fs.realpath:
-          async function EP(t,e){return ZI(await ir.realpath(t),await ir.realpath(e))}
-        """
-        results: List[str] = []
-        anchor_re = re.compile(
-            r'\.realpath\(\w+\)\s*,\s*await\s+\w+\.realpath\(\w+\)\)'
-        )
-
-        # Collect matches first, then patch in reverse order to preserve positions
-        matches = list(anchor_re.finditer(content))
-        for match in reversed(matches):
-            anchor_pos = match.start()
-
-            func_start = self._find_function_start(content, anchor_pos)
-            if func_start is None:
-                continue
-
-            func_end = self._find_matching_brace(content, func_start)
-            if func_end is None:
-                continue
-
-            func_text = content[func_start:func_end]
-
-            # Must be async and short (wrapper, not a complex function)
-            if not func_text.startswith("async") or len(func_text) > 300:
-                continue
-
-            name_match = re.match(r"async\s+function\s+(\w+)", func_text)
-            if not name_match:
-                continue
-            func_name = name_match.group(1)
-
-            replacement = f"async function {func_name}(t,e){{return true}}"
-            content = content[:func_start] + replacement + content[func_end:]
-
-            results.append(f"Async-Wrapper '{func_name}' gepatcht in {basename}")
-            self.log.success(f"Async-Wrapper '{func_name}' gepatcht in {basename}")
-
-        return content, results
-
-    def _patch_inline_checks(self, content: str, basename: str) -> Tuple[str, List[str]]:
-        """
-        Patch inline home-dir checks like the upload validator (b6t pattern):
-          XX.isAbsolute(n)||n.startsWith("..") before a warn/error call
-        """
-        results: List[str] = []
-
-        # Pattern: isAbsolute(X)||X.startsWith("..") followed by error/warn context
-        # Note: \)+ handles the closing parens of both startsWith() and the if()
-        inline_re = re.compile(
-            r'(\w+\.isAbsolute\(\w+\)\|\|\w+\.startsWith\("\.\.")'
-            r'(?=\)+\s*(?:return|&&|\|\|)\s*\w+\.(?:warn|error)\()'
-        )
-
-        for match in inline_re.finditer(content):
-            # Skip TAR library contexts
-            ctx_start = max(0, match.start() - 500)
-            if "TAR_ENTRY" in content[ctx_start:match.end() + 200]:
-                continue
-
-            content = content[:match.start(1)] + "false" + content[match.end(1):]
-            results.append(f"Inline-Check gepatcht in {basename}")
-            self.log.success(f"Inline-Check gepatcht in {basename}")
-            break  # Only replace once per file to avoid offset issues
-
-        return content, results
-
-    def _fallback_patch(self, content: str, basename: str) -> Tuple[str, int]:
-        """
-        Last resort: replace the boolean expression
-          !XX.isAbsolute(r)&&!r.startsWith("..")
-        with 'true' when .relative( appears within 200 chars before.
-        """
-        pattern = re.compile(
-            r'!\w+\.isAbsolute\(\w+\)\s*&&\s*!\w+\.startsWith\("\.\."'
-            r'(?:\))?'
-        )
-        count = 0
-        new_content = content
-
-        for match in pattern.finditer(content):
-            region_before = content[max(0, match.start() - 200):match.start()]
-            if ".relative(" not in region_before:
-                continue
-            # Skip TAR library
-            ctx = content[max(0, match.start() - 500):match.start() + 200]
-            if "TAR_ENTRY" in ctx:
-                continue
-
-            # Find the full expression including the closing paren
-            full_match = match.group(0)
-            if full_match.endswith(")"):
-                replacement = "true)"
-            else:
-                replacement = "true"
-
-            new_content = new_content[:match.start()] + replacement + new_content[match.end():]
-            count += 1
-            self.log.success(f"Fallback-Patch in {basename}")
-            break  # One replacement per file
-
-        return new_content, count
-
-    # ── Brace-counting helpers ────────────────────────────────
-
-    @staticmethod
-    def _find_function_start(content: str, anchor_pos: int) -> Optional[int]:
-        """Scan backwards from anchor_pos to find 'function <name>(' or 'async function <name>('."""
-        search_start = max(0, anchor_pos - 500)
-        region = content[search_start:anchor_pos]
-
-        func_re = re.compile(r"(?:async\s+)?function\s+\w+\s*\(")
-        last_match = None
-        for m in func_re.finditer(region):
-            last_match = m
-
-        if last_match:
-            return search_start + last_match.start()
-        return None
-
-    @staticmethod
-    def _find_matching_brace(content: str, start: int) -> Optional[int]:
-        """
-        From 'start', find the first '{' and count braces to find the matching '}'.
-        Handles string literals to avoid counting braces inside strings.
-        Returns position AFTER the closing '}'.
-        """
-        brace_pos = content.find("{", start)
-        if brace_pos == -1:
-            return None
-
-        depth = 0
-        i = brace_pos
-        # Minified JS functions can be very long; use generous limit
-        limit = min(len(content), brace_pos + 100000)
-
-        while i < limit:
-            ch = content[i]
-
-            # Skip string literals
-            if ch in ('"', "'", "`"):
-                i = AsarPatcher._skip_string(content, i)
-                continue
-
-            # Skip line comments
-            if ch == "/" and i + 1 < limit:
-                next_ch = content[i + 1]
-                if next_ch == "/":
-                    nl = content.find("\n", i + 2)
-                    i = nl + 1 if nl != -1 else limit
-                    continue
-                elif next_ch == "*":
-                    end = content.find("*/", i + 2)
-                    i = end + 2 if end != -1 else limit
-                    continue
-
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return i + 1
-
-            i += 1
-
-        return None
-
-    @staticmethod
-    def _skip_string(content: str, pos: int) -> int:
-        """Skip past a string literal. Returns position after closing quote."""
-        quote = content[pos]
-        i = pos + 1
-        while i < len(content):
-            ch = content[i]
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == quote:
-                return i + 1
-            # Template literals can have ${...} expressions
-            if quote == "`" and ch == "$" and i + 1 < len(content) and content[i + 1] == "{":
-                i += 2
-                depth = 1
-                while i < len(content) and depth > 0:
-                    if content[i] == "{":
-                        depth += 1
-                    elif content[i] == "}":
-                        depth -= 1
-                    elif content[i] == "\\":
-                        i += 1
-                    i += 1
-                continue
-            i += 1
-        return i
-
-    # ── Orchestration ─────────────────────────────────────────
-
-    def run(self, dry_run: bool = False) -> Tuple[str, str]:
-        """
-        Execute Phase 1: extract, patch, repack.
-        Returns (old_hash, new_hash).
-        """
-        old_hash = self.compute_hash(self.asar_path)
-        self.log.info(f"Original-Hash: {old_hash}")
-
-        # Clean tmp dir
-        if os.path.exists(self.tmp_dir):
-            shutil.rmtree(self.tmp_dir)
-
-        self.extract(self.tmp_dir)
-        self.log.success("ASAR extrahiert")
-
-        patch_results = self.patch_js_files(self.tmp_dir)
-
-        if not patch_results:
-            raise RuntimeError(
-                "Keine Validierungsfunktion gefunden! "
-                "Code-Muster evtl. geaendert. Bitte '--dry-run' verwenden."
-            )
-
-        self.log.success(f"{len(patch_results)} Patch(es) angewendet")
-
-        if dry_run:
-            self.log.info("Dry-Run: Keine Dateien geschrieben.")
-            shutil.rmtree(self.tmp_dir, ignore_errors=True)
-            return old_hash, "(dry-run)"
-
-        tmp_asar = self.asar_path + ".new"
-        self.pack(self.tmp_dir, tmp_asar)
-
-        new_hash = self.compute_hash(tmp_asar)
-        self.log.info(f"Neuer Hash: {new_hash}")
-
-        # Replace original
-        shutil.move(tmp_asar, self.asar_path)
-        self.log.success("Phase 1 abgeschlossen")
-
-        return old_hash, new_hash
-
-
-# ─────────────────────────────────────────────────────────────
-# Phase 2: EXE Patcher
-# ─────────────────────────────────────────────────────────────
-
-class ExePatcher:
-    """Replace ASAR integrity hash in claude.exe."""
-
-    def __init__(self, exe_path: str, logger: Logger):
-        self.exe_path = exe_path
-        self.log = logger
-
-    def replace_hash(self, old_hash: str, new_hash: str) -> int:
-        """
-        Find all occurrences of old_hash (ASCII) in claude.exe and replace
-        with new_hash. Reads from .bak for idempotency.
-        Returns number of replacements.
-        """
-        bak = self.exe_path + ".bak"
-        source = bak if os.path.isfile(bak) else self.exe_path
-        self.log.info(f"Lese {os.path.basename(source)} ({os.path.getsize(source) // (1024*1024)} MB)...")
-
-        data = bytearray(Path(source).read_bytes())
-        old_bytes = old_hash.encode("ascii")
-        new_bytes = new_hash.encode("ascii")
-
-        if len(old_bytes) != len(new_bytes):
-            raise RuntimeError(
-                f"Hash-Laengen stimmen nicht ueberein: {len(old_bytes)} vs {len(new_bytes)}"
-            )
-
-        count = 0
-        offset = 0
-        while True:
-            idx = data.find(old_bytes, offset)
-            if idx == -1:
-                break
-            data[idx:idx + len(new_bytes)] = new_bytes
-            offset = idx + len(new_bytes)
-            count += 1
-            self.log.detail(f"Hash ersetzt bei Offset 0x{idx:x}")
-
-        if count > 0:
-            self._wait_unlock(self.exe_path)
-            Path(self.exe_path).write_bytes(bytes(data))
-            self.log.success(f"{count} ASAR-Hash(es) in claude.exe ersetzt")
+def cmd_add(folders: List[str]):
+    """Add external folders to Claude Desktop Cowork."""
+    log.header(f"Claude Cowork Folder Bypass v{VERSION} – Ordner hinzufuegen")
+
+    if not folders:
+        log.error("Keine Ordner angegeben.")
+        sys.exit(1)
+
+    # Validate folders exist
+    for f in folders:
+        p = Path(f)
+        if not p.is_dir():
+            log.error(f"Ordner existiert nicht: {f}")
+            sys.exit(1)
+
+    # Determine home directory for info
+    home = Path.home()
+    external = []
+    for f in folders:
+        norm = normalize_path(f)
+        try:
+            Path(norm).relative_to(home)
+            log.warn(f"'{norm}' ist bereits im Home-Verzeichnis – Bypass nicht noetig")
+        except ValueError:
+            external.append(f)
+            log.step(f"Externer Ordner: {norm}")
+
+    if not external:
+        log.info("Alle Ordner sind im Home-Verzeichnis. Kein Bypass noetig.")
+        return
+
+    claude_dir = get_claude_appdata()
+    config_path = get_config_path(claude_dir)
+    session_dir = find_session_dir(claude_dir)
+
+    if not session_dir:
+        log.error("Keine Cowork-Session gefunden. Bitte zuerst Claude Desktop starten")
+        log.detail("und mindestens einmal Cowork verwenden.")
+        sys.exit(1)
+
+    # Step 1: Add to trusted folders in config
+    log.step("Schritt 1: Trusted Folders in Config aktualisieren...")
+    config = read_config(config_path)
+    for f in external:
+        config = add_trusted_folder(config, f)
+    write_config(config_path, config)
+    log.info(f"Config aktualisiert: {config_path}")
+
+    # Step 2: Add to spaces.json
+    log.step("Schritt 2: Space mit externen Ordnern erstellen...")
+    spaces_path = get_spaces_path(session_dir)
+    spaces_data = read_spaces(spaces_path)
+    spaces_data = add_folders_to_space(spaces_data, external)
+    write_spaces(spaces_path, spaces_data)
+    log.info(f"Spaces aktualisiert: {spaces_path}")
+
+    # Summary
+    space = find_bypass_space(spaces_data)
+    if space:
+        print()
+        log.info(f"Space '{BYPASS_SPACE_NAME}' enthaelt {len(space['folders'])} Ordner:")
+        for f in space["folders"]:
+            log.detail(f["path"])
+
+    print()
+    log.warn("Claude Desktop muss neu gestartet werden!")
+    log.detail("Danach den Space 'External Folders' in Cowork auswaehlen.")
+    print()
+
+
+def cmd_remove(folders: List[str]):
+    """Remove folders from the bypass."""
+    log.header(f"Claude Cowork Folder Bypass v{VERSION} – Ordner entfernen")
+
+    if not folders:
+        log.error("Keine Ordner angegeben.")
+        sys.exit(1)
+
+    claude_dir = get_claude_appdata()
+    config_path = get_config_path(claude_dir)
+    session_dir = find_session_dir(claude_dir)
+
+    # Remove from config
+    log.step("Trusted Folders aus Config entfernen...")
+    config = read_config(config_path)
+    for f in folders:
+        config = remove_trusted_folder(config, f)
+    write_config(config_path, config)
+    log.info("Config aktualisiert.")
+
+    # Remove from spaces
+    if session_dir:
+        log.step("Ordner aus Space entfernen...")
+        spaces_path = get_spaces_path(session_dir)
+        spaces_data = read_spaces(spaces_path)
+        spaces_data = remove_folders_from_space(spaces_data, folders)
+        write_spaces(spaces_path, spaces_data)
+        log.info("Spaces aktualisiert.")
+
+    print()
+    log.warn("Claude Desktop muss neu gestartet werden!")
+    print()
+
+
+def cmd_list():
+    """List currently bypassed folders."""
+    log.header(f"Claude Cowork Folder Bypass v{VERSION} – Status")
+
+    claude_dir = get_claude_appdata()
+    config_path = get_config_path(claude_dir)
+    session_dir = find_session_dir(claude_dir)
+
+    # Trusted folders from config
+    config = read_config(config_path)
+    trusted = get_trusted_folders(config)
+    print(f"  Trusted Folders (Config): {len(trusted)}")
+    for f in trusted:
+        log.detail(f)
+
+    # Spaces
+    if session_dir:
+        spaces_path = get_spaces_path(session_dir)
+        spaces_data = read_spaces(spaces_path)
+        space = find_bypass_space(spaces_data)
+        if space:
+            folders = space.get("folders", [])
+            print(f"\n  Space '{BYPASS_SPACE_NAME}': {len(folders)} Ordner")
+            for f in folders:
+                log.detail(f["path"])
         else:
-            self.log.warn("Alter Hash nicht in claude.exe gefunden!")
+            print(f"\n  Space '{BYPASS_SPACE_NAME}': nicht vorhanden")
+    else:
+        log.warn("Keine Cowork-Session gefunden.")
 
-        return count
-
-    @staticmethod
-    def _wait_unlock(path: str, timeout: int = 20):
-        for _ in range(timeout):
-            try:
-                with open(path, "r+b"):
-                    return
-            except OSError:
-                time.sleep(1)
-        raise RuntimeError(f"Datei '{os.path.basename(path)}' nach {timeout}s noch gesperrt.")
+    print()
 
 
-# ─────────────────────────────────────────────────────────────
-# Patch Manager (Orchestration)
-# ─────────────────────────────────────────────────────────────
+def cmd_status():
+    """Show system status."""
+    log.header(f"Claude Cowork Folder Bypass v{VERSION} – System-Status")
 
-class PatchManager:
-    """Orchestrates all patch phases with atomic rollback."""
+    claude_dir = get_claude_appdata()
+    log.info(f"Claude AppData: {claude_dir}")
 
-    def __init__(self, logger: Logger):
-        self.log = logger
-        self._paths: Optional[InstallPaths] = None
+    config_path = get_config_path(claude_dir)
+    log.info(f"Config: {config_path} {'(existiert)' if config_path.exists() else '(fehlt)'}")
 
-    # ── Admin check ───────────────────────────────────────────
+    session_dir = find_session_dir(claude_dir)
+    if session_dir:
+        log.info(f"Session-Dir: {session_dir}")
+        spaces_path = get_spaces_path(session_dir)
+        exists_str = "(existiert)" if spaces_path.exists() else "(neu)"
+        log.info(f"Spaces: {spaces_path} {exists_str}")
+    else:
+        log.warn("Keine Cowork-Session gefunden.")
 
-    @staticmethod
-    def _is_admin() -> bool:
-        try:
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return False
+    # Show config
+    config = read_config(config_path)
+    trusted = get_trusted_folders(config)
+    if trusted:
+        log.info(f"Trusted Folders: {len(trusted)}")
+        for f in trusted:
+            log.detail(f)
+    else:
+        log.detail("Keine Trusted Folders konfiguriert.")
 
-    def _ensure_admin(self):
-        if self._is_admin():
-            return
+    # Show spaces
+    if session_dir:
+        spaces_data = read_spaces(get_spaces_path(session_dir))
+        total_spaces = len(spaces_data.get("spaces", []))
+        log.info(f"Spaces gesamt: {total_spaces}")
+        bypass = find_bypass_space(spaces_data)
+        if bypass:
+            log.info(f"Bypass-Space: {len(bypass.get('folders', []))} Ordner")
+        else:
+            log.detail("Kein Bypass-Space vorhanden.")
 
-        self.log.warn("Fordere Administrator-Rechte an...")
-        script = os.path.abspath(sys.argv[0])
-        # Build argument list for PowerShell Start-Process
-        # Quote args containing spaces, leave simple args unquoted
-        parts = [f'`"{script}`"']
-        for a in sys.argv[1:]:
-            parts.append(f'`"{a}`"' if " " in a else a)
-        args_str = " ".join(parts)
-        ps_cmd = (
-            f'Start-Process -FilePath "{sys.executable}" -Verb RunAs '
-            f'-ArgumentList "{args_str}" -Wait'
-        )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd])
-        sys.exit(0)
-
-    # ── Prerequisites ─────────────────────────────────────────
-
-    def _check_npx(self):
-        try:
-            r = subprocess.run(
-                ["npx", "--version"], capture_output=True, text=True,
-                timeout=15, shell=True
-            )
-            if r.returncode == 0:
-                self.log.info(f"npx Version: {r.stdout.strip()}")
-                return
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-        raise RuntimeError(
-            "Node.js (npx) wird benoetigt. Bitte installieren: https://nodejs.org"
-        )
-
-    # ── Service management ────────────────────────────────────
-
-    def _stop_services(self):
-        self.log.step("Stoppe Claude-Prozesse und -Dienste...")
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", '''
-                $svc = Get-WmiObject Win32_Service |
-                    Where-Object { $_.PathName -match "cowork-svc" }
-                if ($svc) {
-                    Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
-                    for ($w = 0; $w -lt 10; $w++) {
-                        $state = (Get-Service -Name $svc.Name -EA SilentlyContinue).Status
-                        if ($state -eq 'Stopped' -or -not $state) { break }
-                        Start-Sleep -Seconds 1
-                    }
-                }
-                Stop-Process -Name "claude" -Force -ErrorAction SilentlyContinue
-                Stop-Process -Name "cowork-svc" -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-                $rem = Get-Process -Name "cowork-svc" -ErrorAction SilentlyContinue
-                if ($rem) {
-                    Start-Sleep -Seconds 5
-                    Stop-Process -Name "cowork-svc" -Force -ErrorAction SilentlyContinue
-                }
-            '''],
-            capture_output=True, timeout=60
-        )
-        self.log.success("Prozesse und Dienste gestoppt")
-
-    def _start_services(self):
-        self.log.step("Starte Claude-Dienste...")
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", '''
-                $svc = Get-WmiObject Win32_Service |
-                    Where-Object { $_.PathName -match "cowork-svc" }
-                if ($svc) {
-                    # Force-stop any remnants
-                    Stop-Process -Name "cowork-svc" -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 2
-                    Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
-                    for ($w = 0; $w -lt 15; $w++) {
-                        $state = (Get-Service -Name $svc.Name -EA SilentlyContinue).Status
-                        if ($state -eq 'Running') { break }
-                        Start-Sleep -Seconds 1
-                    }
-                }
-                try {
-                    Start-Process "shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude" -ErrorAction SilentlyContinue
-                } catch {}
-            '''],
-            capture_output=True, timeout=60
-        )
-        self.log.success("Dienste gestartet")
-
-    # ── Filesystem helpers ────────────────────────────────────
-
-    def _take_ownership(self, path: str):
-        self.log.info(f"Setze Rechte: {path}")
-        subprocess.run(
-            f'takeown /F "{path}" /R /D Y >nul 2>&1',
-            shell=True, capture_output=True, timeout=60
-        )
-        subprocess.run(
-            f'icacls "{path}" /grant Administrators:F /T /Q >nul 2>&1',
-            shell=True, capture_output=True, timeout=60
-        )
-
-    def _create_backups(self, paths: List[str]):
-        self.log.step("Erstelle Backups...")
-        for p in paths:
-            if not os.path.isfile(p):
-                continue
-            bak = p + ".bak"
-            if not os.path.isfile(bak):
-                shutil.copy2(p, bak)
-                self.log.success(f"{os.path.basename(bak)} erstellt")
-            else:
-                self.log.info(f"{os.path.basename(bak)} existiert bereits")
-
-    # ── Install ───────────────────────────────────────────────
-
-    def install(self, dry_run: bool = False):
-        print(f"\n{'=' * 55}")
-        print("     CLAUDE COWORK ORDNER-PATCH INSTALLIEREN")
-        print(f"{'=' * 55}\n")
-
-        self._ensure_admin()
-        self._check_npx()
-
-        self._paths = ClaudeFinder().find()
-        p = self._paths
-        self.log.success(f"Claude gefunden: {p.base_dir} ({p.layout})")
-        self.log.info(f"ASAR: {p.asar_path}")
-        self.log.info(f"EXE:  {p.exe_path}")
-
-        if not dry_run:
-            self._stop_services()
-
-            if p.layout == "msix":
-                self.log.step("Rechte setzen (MSIX)...")
-                self._take_ownership(p.app_dir)
-                self._take_ownership(p.resources_dir)
-
-            self._create_backups([p.asar_path, p.exe_path])
-
-        try:
-            # Phase 1: ASAR Injection
-            self.log.step("Phase 1: ASAR-Injection")
-            asar = AsarPatcher(p.asar_path, TMP_DIR, self.log)
-            old_hash, new_hash = asar.run(dry_run=dry_run)
-
-            if dry_run:
-                print(f"\n{'=' * 55}")
-                print("  DRY-RUN ABGESCHLOSSEN (keine Dateien geaendert)")
-                print(f"{'=' * 55}\n")
-                return
-
-            # Phase 2: Hash Replacement
-            self.log.step("Phase 2: Hash-Ersetzung in claude.exe")
-            exe = ExePatcher(p.exe_path, self.log)
-            exe.replace_hash(old_hash, new_hash)
-
-            # Cleanup and start
-            self.log.step("Aufraeumen und Starten")
-            if os.path.exists(TMP_DIR):
-                shutil.rmtree(TMP_DIR, ignore_errors=True)
-            self._start_services()
-
-            print(f"\n{'=' * 55}")
-            print("  PATCH ERFOLGREICH INSTALLIERT!")
-            print(f"{'=' * 55}")
-            print()
-            print("  Netzlaufwerke und externe Ordner sind jetzt")
-            print("  im Cowork Folder-Picker verfuegbar.")
-            print()
-            print("  HINWEIS: Nach Claude-Updates erneut ausfuehren!")
-            print(f"  Log: {LOG_PATH}")
-            print()
-
-        except Exception as e:
-            self.log.error(f"KRITISCHER FEHLER: {e}")
-            self.log.warn("Starte automatischen Rollback...")
-            self.restore(is_rollback=True)
-            raise SystemExit(
-                f"\nInstallation fehlgeschlagen. System auf Originalzustand zurueckgesetzt.\n"
-                f"Ursache: {e}"
-            )
-
-    # ── Restore ───────────────────────────────────────────────
-
-    def restore(self, is_rollback: bool = False):
-        if not is_rollback:
-            print(f"\n{'=' * 55}")
-            print("     AUF ORIGINALZUSTAND ZURUECKSETZEN")
-            print(f"{'=' * 55}\n")
-            self._ensure_admin()
-
-        try:
-            paths = ClaudeFinder().find()
-        except FileNotFoundError:
-            if is_rollback:
-                self.log.warn("Claude-Verzeichnis nicht gefunden.")
-                return
-            raise
-
-        if not is_rollback:
-            self._stop_services()
-
-        if paths.layout == "msix":
-            self._take_ownership(paths.app_dir)
-            self._take_ownership(paths.resources_dir)
-
-        self.log.info("Stelle Originaldateien wieder her...")
-        restored = False
-        for orig in [paths.asar_path, paths.exe_path]:
-            bak = orig + ".bak"
-            if os.path.isfile(bak):
-                try:
-                    shutil.copy2(bak, orig)
-                    self.log.success(f"Wiederhergestellt: {os.path.basename(orig)}")
-                    restored = True
-                except OSError as e:
-                    self.log.warn(f"Fehler bei {os.path.basename(orig)}: {e}")
-            else:
-                self.log.warn(f"Kein Backup fuer {os.path.basename(orig)}")
-
-        # Cleanup temp dir
-        if os.path.exists(TMP_DIR):
-            shutil.rmtree(TMP_DIR, ignore_errors=True)
-
-        if not is_rollback:
-            self._start_services()
-            if restored:
-                self.log.success("Wiederherstellung abgeschlossen.")
-            else:
-                self.log.warn("Keine Backup-Dateien gefunden.")
-
-        if is_rollback:
-            self.log.success("Rollback abgeschlossen.")
-
-    # ── Status ────────────────────────────────────────────────
-
-    def status(self):
-        print("\n  Status-Pruefung...\n")
-
-        try:
-            paths = ClaudeFinder().find()
-        except FileNotFoundError as e:
-            self.log.warn(str(e))
-            return
-
-        # Extract ASAR to check for marker
-        chk_dir = os.path.join(tempfile.gettempdir(), "claude_folder_patch_chk")
-        if os.path.exists(chk_dir):
-            shutil.rmtree(chk_dir)
-
-        try:
-            subprocess.run(
-                ["npx", "--yes", "@electron/asar", "extract", paths.asar_path, chk_dir],
-                capture_output=True, timeout=120, shell=True
-            )
-
-            patched = False
-            for js_path in glob.glob(os.path.join(chk_dir, "**", "*.js"), recursive=True):
-                try:
-                    with open(js_path, "r", encoding="utf-8") as f:
-                        head = f.read(len(PATCH_MARKER) + 10)
-                    if PATCH_MARKER in head:
-                        patched = True
-                        break
-                except (OSError, UnicodeDecodeError):
-                    continue
-
-            bak_exists = os.path.isfile(paths.asar_path + ".bak")
-
-            if patched:
-                print("  Status: \033[32mGEPATCHT\033[0m")
-                print("  Ordner-Einschraenkung: \033[32mDEAKTIVIERT\033[0m")
-            else:
-                print("  Status: \033[33mORIGINAL\033[0m")
-                print("  Ordner-Einschraenkung: \033[33mAKTIV\033[0m")
-
-            print(f"  Backup vorhanden: {'Ja' if bak_exists else 'Nein'}")
-            print(f"  Installation: {paths.base_dir}")
-            print(f"  Layout: {paths.layout}")
-            print()
-
-        except Exception as e:
-            self.log.warn(f"Status-Pruefung fehlgeschlagen: {e}")
-        finally:
-            if os.path.exists(chk_dir):
-                shutil.rmtree(chk_dir, ignore_errors=True)
+    print()
 
 
 # ─────────────────────────────────────────────────────────────
-# CLI Entry Point
+# CLI
 # ─────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Desktop Cowork - Ordner-Patch v" + VERSION,
-        epilog=(
-            "Entfernt die Home-Directory-Einschraenkung im Cowork Folder-Picker.\n"
-            "Erfordert: Administrator-Rechte, Node.js (npx), PowerShell 5.1+"
-        ),
+        description="Claude Desktop Cowork – Folder Restriction Bypass",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sub = parser.add_subparsers(dest="command")
-    sub.required = True
+        epilog="""
+Beispiele:
+  %(prog)s add "C:\\Projects" "D:\\Data"     Ordner hinzufuegen
+  %(prog)s add "\\\\server\\share"             Netzlaufwerk hinzufuegen
+  %(prog)s remove "C:\\Projects"             Ordner entfernen
+  %(prog)s list                              Aktuelle Ordner anzeigen
+  %(prog)s status                            System-Status pruefen
 
-    install_p = sub.add_parser("install", help="Patch installieren")
-    install_p.add_argument(
-        "--dry-run", action="store_true",
-        help="Nur analysieren, keine Dateien aendern"
+Hinweis: Claude Desktop muss nach Aenderungen neu gestartet werden.
+         Danach den Space 'External Folders' in Cowork auswaehlen.
+        """,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s v{VERSION}")
 
-    sub.add_parser("restore", help="Originalzustand wiederherstellen")
-    sub.add_parser("status", help="Patch-Status pruefen")
+    sub = parser.add_subparsers(dest="command", help="Verfuegbare Befehle")
+
+    p_add = sub.add_parser("add", help="Externe Ordner hinzufuegen")
+    p_add.add_argument("folders", nargs="+", help="Ordnerpfade")
+
+    p_rm = sub.add_parser("remove", help="Ordner entfernen")
+    p_rm.add_argument("folders", nargs="+", help="Ordnerpfade")
+
+    sub.add_parser("list", help="Aktuelle Ordner anzeigen")
+    sub.add_parser("status", help="System-Status pruefen")
+
+    # Legacy compatibility: accept 'install', 'restore' as aliases
+    sub.add_parser("install", help=argparse.SUPPRESS)
+    sub.add_parser("restore", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
-    logger = Logger(LOG_PATH)
 
-    try:
-        mgr = PatchManager(logger)
-
+    if args.command == "add":
+        cmd_add(args.folders)
+    elif args.command == "remove":
+        cmd_remove(args.folders)
+    elif args.command == "list":
+        cmd_list()
+    elif args.command in ("status", "install", "restore"):
         if args.command == "install":
-            mgr.install(dry_run=args.dry_run)
+            log.warn("'install' ist veraltet. Nutze: add <ordner>")
+            log.detail("Beispiel: python patch_cowork_folders.py add \"C:\\Projects\"")
+            print()
         elif args.command == "restore":
-            mgr.restore()
-        elif args.command == "status":
-            mgr.status()
-
-    except SystemExit:
-        raise
-    except KeyboardInterrupt:
-        logger.warn("Abgebrochen durch Benutzer.")
-        sys.exit(130)
-    except Exception as e:
-        logger.error(str(e))
+            log.warn("'restore' ist veraltet. Nutze: remove <ordner>")
+            log.detail("Beispiel: python patch_cowork_folders.py remove \"C:\\Projects\"")
+            print()
+        cmd_status()
+    else:
+        parser.print_help()
         sys.exit(1)
-    finally:
-        logger.close()
 
 
 if __name__ == "__main__":
