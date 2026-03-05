@@ -1,7 +1,6 @@
 <#
 .SYNOPSIS
     One-Click Launcher fuer den Cowork Folder Bypass.
-    Nutzt das lokale Python-Skript oder laedt es von GitHub.
 
 .DESCRIPTION
     Kann lokal oder per PowerShell-Einzeiler gestartet werden:
@@ -44,14 +43,10 @@ if (-not $Python) {
 
 # ── Finde Bypass-Skript ──
 Write-Host ""
-Write-Host "  Claude Cowork Folder Bypass v5.0" -ForegroundColor Cyan
+Write-Host "  Claude Cowork Folder Bypass v5.1" -ForegroundColor Cyan
 Write-Host "  =================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Umgeht die Home-Verzeichnis-Beschraenkung im Cowork" -ForegroundColor Gray
-Write-Host "  Folder Picker durch Config-Manipulation (kein Patching)." -ForegroundColor Gray
-Write-Host ""
 
-# Strategie: Lokales Skript bevorzugen, GitHub als Fallback
 $ScriptPath = $null
 
 # 1. Neben dieser run.ps1 (lokale Ausfuehrung)
@@ -61,19 +56,18 @@ if ($PSScriptRoot -and (Test-Path $LocalScript)) {
     Write-Host "  [+] Lokales Skript gefunden" -ForegroundColor Green
 }
 
-# 2. GitHub-Download als Fallback (z.B. bei irm|iex)
+# 2. GitHub-Download als Fallback
 if (-not $ScriptPath) {
     $DownloadPath = Join-Path $TmpDir "patch_cowork_folders.py"
     if (-not (Test-Path $TmpDir)) { New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null }
 
-    Write-Host "  [*] Kein lokales Skript, lade von GitHub..." -ForegroundColor Gray
+    Write-Host "  [*] Lade von GitHub..." -ForegroundColor Gray
     try {
         Invoke-RestMethod -Uri $ToolPath -OutFile $DownloadPath
         $ScriptPath = $DownloadPath
         Write-Host "  [+] Download erfolgreich" -ForegroundColor Green
     } catch {
         Write-Host "  [X] Download fehlgeschlagen: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "  [!] Tipp: run.ps1 im selben Ordner wie patch_cowork_folders.py ausfuehren" -ForegroundColor Yellow
         pause
         exit 1
     }
@@ -82,47 +76,18 @@ if (-not $ScriptPath) {
 # ── Auswahl ──
 Write-Host ""
 Write-Host "  Aktion waehlen:" -ForegroundColor White
-Write-Host "    1. Ordner hinzufuegen (Pfad eingeben)" -ForegroundColor White
-Write-Host "    2. Ordner entfernen" -ForegroundColor White
-Write-Host "    3. Aktuelle Ordner anzeigen" -ForegroundColor White
-Write-Host "    4. System-Status" -ForegroundColor White
-Write-Host "    5. Beenden" -ForegroundColor White
+Write-Host "    1. Bypass installieren (DevTools + Anleitung)" -ForegroundColor White
+Write-Host "    2. Bypass entfernen" -ForegroundColor White
+Write-Host "    3. Status pruefen" -ForegroundColor White
+Write-Host "    4. Beenden" -ForegroundColor White
 Write-Host ""
-$choice = Read-Host "  Auswahl (1-5)"
+$choice = Read-Host "  Auswahl (1-4)"
 
 switch ($choice) {
-    "1" {
-        Write-Host ""
-        $folder = Read-Host "  Ordnerpfad eingeben (z.B. C:\Projects oder \\server\share)"
-        if (-not $folder) {
-            Write-Host "  Kein Pfad eingegeben." -ForegroundColor Red
-            pause
-            exit 1
-        }
-        $pyArgs = @($ScriptPath, "add", $folder)
-        & $Python @pyArgs
-    }
-    "2" {
-        Write-Host ""
-        # Show current folders first
-        & $Python $ScriptPath "list"
-        Write-Host ""
-        $folder = Read-Host "  Ordnerpfad zum Entfernen eingeben"
-        if (-not $folder) {
-            Write-Host "  Kein Pfad eingegeben." -ForegroundColor Red
-            pause
-            exit 1
-        }
-        $pyArgs = @($ScriptPath, "remove", $folder)
-        & $Python @pyArgs
-    }
-    "3" {
-        & $Python $ScriptPath "list"
-    }
-    "4" {
-        & $Python $ScriptPath "status"
-    }
-    "5" { exit 0 }
+    "1" { & $Python $ScriptPath "install" }
+    "2" { & $Python $ScriptPath "restore" }
+    "3" { & $Python $ScriptPath "status" }
+    "4" { exit 0 }
     default {
         Write-Host "  Ungueltige Auswahl." -ForegroundColor Red
         pause
@@ -131,5 +96,5 @@ switch ($choice) {
 }
 
 Write-Host ""
-Write-Host "  Fertig. Enter zum Beenden..." -ForegroundColor Gray
+Write-Host "  Enter zum Beenden..." -ForegroundColor Gray
 pause

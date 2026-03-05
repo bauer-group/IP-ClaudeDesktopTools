@@ -1,86 +1,53 @@
 # Cowork Folder Bypass
 
-Umgeht die Home-Directory-Einschraenkung im Claude Desktop Cowork Folder-Picker. Ermoeglicht Netzlaufwerke, externe Laufwerke und domaeneumgeleitete Ordner.
+Ermoeglicht die Nutzung von Ordnern ausserhalb von `%USERPROFILE%` im Claude Desktop Cowork Folder-Picker (Netzlaufwerke, externe Laufwerke, domaeneumgeleitete Ordner).
 
-## Problem
+## Was es tut
 
-Claude Desktop Cowork erlaubt im Folder-Picker nur Ordner innerhalb von `%USERPROFILE%`. In Domaenenumgebungen mit Ordnerumleitung, bei Netzlaufwerken oder externen Datentraegern schlaegt die Auswahl fehl.
+1. Aktiviert DevTools in Claude Desktop (`developer_settings.json`)
+2. Zeigt ein JavaScript-Snippet, das den Folder-Picker **ohne** Home-Dir-Restriktion oeffnet
 
-## Technik (v5.0 – Config-basierter Bypass)
+## Einschraenkungen
 
-Die Ordner-Restriktion existiert **ausschliesslich** in der UI-Funktion `browseFolder` (Electron Main Process). Alle nachgelagerten Systeme akzeptieren beliebige Pfade ohne eigene Validierung:
+- **Kein permanenter Patch** - das Snippet muss pro Session in der DevTools-Console ausgefuehrt werden
+- Binary-Patching ist nicht moeglich (bricht Authenticode-Signatur)
+- Config-Injection via `spaces.json` funktioniert nicht (SpacesManager wird in v1.1.x nie initialisiert)
 
-| Komponente | Validierung |
-|-----------|------------|
-| `browseFolder` (UI) | Home-Dir-Check via `path.relative` + `startsWith("..")` |
-| `addFolderToSpace` | Keine – fuegt Pfad direkt hinzu |
-| `loadSpacesFromDisk` | Nur Schema-Validierung (Feldtypen) |
-| `startSession` | Akzeptiert `userSelectedFolders` direkt |
-| `SY` (Datei-Zugriff) | Prueft gegen `userSelectedFolders`, nicht gegen Home-Dir |
+## Warum dieser Ansatz
 
-**Bypass-Strategie:** Ordnerpfade direkt in `spaces.json` und `localAgentModeTrustedFolders` schreiben. Die UI-Sperre (`browseFolder`) wird nie aufgerufen, da der Ordner bereits im Space vorhanden ist.
-
-### Aeltere Versionen (v1–v4) – Nicht mehr verwendet
-
-Die frueheren Versionen versuchten Binary-Patching (ASAR-Injection + Hash-Ersetzung in `claude.exe`). Dieser Ansatz scheitert, weil jede Aenderung an `claude.exe` die Authenticode-Signatur bricht und `cowork-svc.exe` den Start verweigert.
+Die Ordner-Restriktion existiert **nur** in `browseFolder(title, restrictToHomeDir)` im Electron Main Process. Alle nachgelagerten Systeme (`startSession`, Datei-Zugriff) akzeptieren beliebige Pfade. Ueber die DevTools-Console laesst sich `browseFolder("title", false)` direkt aufrufen.
 
 ## Voraussetzungen
 
 - Windows 10/11 mit Claude Desktop
 - Python 3.8+
-- **Keine** Administrator-Rechte noetig
-- **Kein** Node.js noetig
+- Keine Administrator-Rechte noetig
 
-## Schnellstart (One-Click)
-
-PowerShell oeffnen und ausfuehren:
-
-```powershell
-irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/cowork-folder-patch/run.ps1 | iex
-```
-
-Der Launcher bietet ein interaktives Menue zum Hinzufuegen und Entfernen von Ordnern.
-
-## Manuelle Verwendung
+## Benutzung
 
 ```bash
-# Externe Ordner hinzufuegen
-python patch_cowork_folders.py add "C:\Projects" "D:\Data"
-
-# Netzlaufwerk hinzufuegen
-python patch_cowork_folders.py add "\\server\share"
-
-# Ordner entfernen
-python patch_cowork_folders.py remove "C:\Projects"
-
-# Aktuelle Ordner anzeigen
-python patch_cowork_folders.py list
-
-# System-Status pruefen
-python patch_cowork_folders.py status
+python patch_cowork_folders.py install     # DevTools aktivieren + Anleitung
+python patch_cowork_folders.py restore     # DevTools deaktivieren, aufraumen
+python patch_cowork_folders.py status      # Status anzeigen
 ```
 
-## Nach der Installation
+### Ablauf
 
-1. **Claude Desktop neu starten**
-2. In Cowork den Space **"External Folders"** auswaehlen
-3. Die externen Ordner sind im Space verfuegbar
+1. `install` ausfuehren
+2. Claude Desktop neu starten
+3. DevTools oeffnen (`Ctrl+Shift+I`)
+4. Console-Tab waehlen
+5. Snippet einfuegen (wird von `install` angezeigt) + Enter
+6. Ordner waehlen, in Cowork Nachricht senden
 
-## Nach Claude-Updates
-
-Der Bypass bleibt bestehen, da keine Binaries modifiziert werden. Die Konfiguration in `spaces.json` und `claude_desktop_config.json` ueberlebt Updates.
-
-## Was wird geaendert?
+## Was wird geaendert
 
 | Datei | Aenderung |
-|-------|----------|
-| `%APPDATA%\Claude\claude_desktop_config.json` | Ordner in `preferences.localAgentModeTrustedFolders` eingetragen |
-| `%APPDATA%\Claude\local-agent-mode-sessions\{accountId}\{userId}\spaces.json` | Space "External Folders" mit den Ordnern erstellt |
+| --- | --- |
+| `%APPDATA%\Claude\developer_settings.json` | `allowDevTools: true` |
+
+Das JS-Snippet schreibt zur Laufzeit `localAgentModeTrustedFolders` in `claude_desktop_config.json` (wird von `restore` aufgeraeumt).
 
 ## Disclaimer
 
 Dieses Tool modifiziert Claude Desktop Konfigurationsdateien auf nicht von Anthropic autorisierte Weise. Nutzung auf eigenes Risiko.
-
-## Referenzen
-
-- GitHub Issues [#20550](https://github.com/anthropics/claude-code/issues/20550), [#24964](https://github.com/anthropics/claude-code/issues/24964) – Dokumentation der Validierungsfunktion

@@ -4,15 +4,13 @@ Interne Werkzeuge fuer Claude Desktop. Jedes Tool liegt in einem eigenen Unteror
 
 ## Tools
 
-| Tool | Beschreibung | Pfad |
-|------|-------------|------|
-| **Cowork Folder Bypass** | Umgeht die Home-Directory-Einschraenkung im Cowork Folder-Picker per Config-Injection | [`tools/cowork-folder-patch/`](tools/cowork-folder-patch/) |
+| Tool                     | Beschreibung                                                                 | Pfad                                                        |
+|--------------------------|------------------------------------------------------------------------------|-------------------------------------------------------------|
+| **Cowork Folder Bypass** | Ermoeglicht externe Ordner im Cowork Folder-Picker per DevTools + JS-Snippet | [`tools/cowork-folder-patch/`](tools/cowork-folder-patch/)  |
 
 ## Schnellstart
 
-Jedes Tool kann direkt aus dem GitHub-Repository per PowerShell-Einzeiler gestartet werden:
-
-**Cowork Folder Bypass:**
+Per PowerShell-Einzeiler:
 
 ```powershell
 irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/cowork-folder-patch/run.ps1 | iex
@@ -21,15 +19,15 @@ irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/too
 Oder lokal:
 
 ```bash
-python tools/cowork-folder-patch/patch_cowork_folders.py add "C:\Projects"
+python tools/cowork-folder-patch/patch_cowork_folders.py install
 ```
 
-## Voraussetzungen (allgemein)
+## Voraussetzungen
 
 - Windows 10/11
 - Python 3.8+
 
-Einzelne Tools koennen weitere Abhaengigkeiten haben — siehe jeweilige README.
+Einzelne Tools koennen weitere Abhaengigkeiten haben - siehe jeweilige README.
 
 ## Neues Tool hinzufuegen
 
