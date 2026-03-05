@@ -1,3 +1,9 @@
+## [0.1.1](https://github.com/bauer-group/IP-ClaudeDesktopTools/compare/v0.1.0...v0.1.1) (2026-03-05)
+
+### 🐛 Bug Fixes
+
+* Refactor Cowork Folder Patch script to Cowork Folder Bypass; update functionality and user prompts for folder management ([383aa1c](https://github.com/bauer-group/IP-ClaudeDesktopTools/commit/383aa1c40088c1cfb1f3a11984efda6946b22305))
+
 ## [0.1.0](https://github.com/bauer-group/IP-ClaudeDesktopTools/compare/v0.0.0...v0.1.0) (2026-03-04)
 
 ### 🚀 Features
