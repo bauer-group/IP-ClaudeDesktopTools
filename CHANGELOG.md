@@ -1,3 +1,9 @@
+## [0.1.2](https://github.com/bauer-group/IP-ClaudeDesktopTools/compare/v0.1.1...v0.1.2) (2026-03-05)
+
+### 🐛 Bug Fixes
+
+* Aktualisiere README und Skripte für Cowork Folder Bypass; verbessere Dokumentation und Benutzeranweisungen ([bd65042](https://github.com/bauer-group/IP-ClaudeDesktopTools/commit/bd6504270dc2974b3a58d550578e74a9df139591))
+
 ## [0.1.1](https://github.com/bauer-group/IP-ClaudeDesktopTools/compare/v0.1.0...v0.1.1) (2026-03-05)
 
 ### 🐛 Bug Fixes
