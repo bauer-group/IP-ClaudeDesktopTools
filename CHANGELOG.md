@@ -1,3 +1,9 @@
+## [0.2.0](https://github.com/bauer-group/IP-ClaudeDesktopTools/compare/v0.1.2...v0.2.0) (2026-03-07)
+
+### 🚀 Features
+
+* Add MCP Server Manager and Config Sync tools ([f6b7649](https://github.com/bauer-group/IP-ClaudeDesktopTools/commit/f6b7649d80de6ce677e40c07761cafd5155b4118))
+
 ## [0.1.2](https://github.com/bauer-group/IP-ClaudeDesktopTools/compare/v0.1.1...v0.1.2) (2026-03-05)
 
 ### 🐛 Bug Fixes
