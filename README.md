@@ -4,21 +4,32 @@ Interne Werkzeuge fuer Claude Desktop. Jedes Tool liegt in einem eigenen Unteror
 
 ## Tools
 
-| Tool                     | Beschreibung                                                                 | Pfad                                                        |
-|--------------------------|------------------------------------------------------------------------------|-------------------------------------------------------------|
-| **Cowork Folder Bypass** | Ermoeglicht externe Ordner im Cowork Folder-Picker per DevTools + JS-Snippet | [`tools/cowork-folder-patch/`](tools/cowork-folder-patch/)  |
+| Tool                        | Beschreibung                                                                 | Pfad                                                        |
+|-----------------------------|------------------------------------------------------------------------------|-------------------------------------------------------------|
+| **Cowork Folder Bypass**    | Ermoeglicht externe Ordner im Cowork Folder-Picker per DevTools + JS-Snippet | [`tools/cowork-folder-patch/`](tools/cowork-folder-patch/)  |
+| **MCP Server Manager**      | Legacy MCP Server verwalten (anzeigen, hinzufuegen, testen, exportieren)     | [`tools/mcp-manager/`](tools/mcp-manager/)                  |
+| **Config Backup & Restore** | Backup/Restore von Claude Desktop & Code Konfigurationen                     | [`tools/config-sync/`](tools/config-sync/)                  |
 
 ## Schnellstart
 
-Per PowerShell-Einzeiler:
+Jedes Tool per PowerShell-Einzeiler oder lokal starten:
 
 ```powershell
+# Cowork Folder Bypass
 irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/cowork-folder-patch/run.ps1 | iex
+
+# MCP Server Manager
+irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/mcp-manager/run.ps1 | iex
+
+# Config Backup & Restore
+irm https://raw.githubusercontent.com/bauer-group/IP-ClaudeDesktopTools/main/tools/config-sync/run.ps1 | iex
 ```
 
 Oder lokal:
 
 ```bash
+python tools/mcp-manager/mcp_manager.py list
+python tools/config-sync/config_sync.py backup
 python tools/cowork-folder-patch/patch_cowork_folders.py install
 ```
 
